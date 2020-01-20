@@ -508,8 +508,6 @@ struct log_t{
 	MY_ALIGNED(CACHE_LINE_SIZE)
 	LogSysMutex	mutex;		/*!< mutex protecting the log */
 	MY_ALIGNED(CACHE_LINE_SIZE)
-	LogSysMutex	write_mutex;	/*!< mutex protecting writing to log */
-	MY_ALIGNED(CACHE_LINE_SIZE)
 	FlushOrderMutex	log_flush_order_mutex;/*!< mutex to serialize access to
 					the flush list when we are putting
 					dirty blocks in the list. The idea
@@ -641,13 +639,7 @@ struct log_t{
 					AND flushed to disk */
 	std::atomic<size_t> pending_flushes; /*!< system calls in progress */
 	std::atomic<size_t> flushes;	/*!< system calls counter */
-	ulint		n_pending_flushes;/*!< number of currently
-					pending flushes; protected by
-					log_sys.mutex */
-	os_event_t	flush_event;	/*!< this event is in the reset state
-					when a flush is running;
-					os_event_set() and os_event_reset()
-					are protected by log_sys.mutex */
+
 	ulint		n_log_ios;	/*!< number of log i/os initiated thus
 					far */
 	ulint		n_log_ios_old;	/*!< number of log i/o's at the
@@ -832,12 +824,6 @@ inline void log_t::files::set_lsn_offset(lsn_t a_lsn) {
 
 /** Release the log sys write mutex.*/
 #define log_write_mutex_exit() mutex_exit(&log_sys.write_mutex)
-
-/** Release all the log sys mutexes. */
-#define log_mutex_exit_all() do {		\
-	mutex_exit(&log_sys.mutex);		\
-	mutex_exit(&log_sys.write_mutex);	\
-} while (0)
 
 /* log scrubbing speed, in bytes/sec */
 extern ulonglong innodb_scrub_log_speed;

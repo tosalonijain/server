@@ -529,7 +529,6 @@ void log_t::create()
   m_initialised= true;
 
   mutex_create(LATCH_ID_LOG_SYS, &mutex);
-  mutex_create(LATCH_ID_LOG_WRITE, &write_mutex);
   mutex_create(LATCH_ID_LOG_FLUSH_ORDER, &log_flush_order_mutex);
 
   /* Start the lsn from one log block from zero: this way every
@@ -555,9 +554,6 @@ void log_t::create()
   buf_next_to_write= 0;
   write_lsn= lsn;
   flushed_to_disk_lsn= 0;
-  n_pending_flushes= 0;
-  flush_event = os_event_create("log_flush_event");
-  os_event_set(flush_event);
   n_log_ios= 0;
   n_log_ios_old= 0;
   log_group_capacity= 0;
@@ -894,20 +890,14 @@ loop:
 and invoke log_mutex_enter(). */
 static
 void
-log_write_flush_to_disk_low()
+log_write_flush_to_disk_low(lsn_t lsn)
 {
-	/* FIXME: This is not holding log_sys.mutex while
-	calling os_event_set()! */
-	ut_a(log_sys.n_pending_flushes == 1); /* No other threads here */
-
 	log_sys.log.flush_data_only();
 
 	log_mutex_enter();
-	log_sys.flushed_to_disk_lsn = log_sys.current_flush_lsn;
-
-	log_sys.n_pending_flushes--;
-
-	os_event_set(log_sys.flush_event);
+	if (lsn > log_sys.flushed_to_disk_lsn)
+		log_sys.flushed_to_disk_lsn = lsn;
+	log_mutex_exit();
 }
 
 /** Switch the log buffer in use, and copy the content of last block
@@ -945,87 +935,29 @@ log_buffer_switch()
 	log_sys.buf_next_to_write = log_sys.buf_free;
 }
 
-/** Ensure that the log has been written to the log file up to a given
-log entry (such as that of a transaction commit). Start a new write, or
-wait and check if an already running write is covering the request.
-@param[in]	lsn		log sequence number that should be
-included in the redo log file write
-@param[in]	flush_to_disk	whether the written log should also
-be flushed to the file system
-@param[in]	rotate_key	whether to rotate the encryption key */
-void log_write_up_to(lsn_t lsn, bool flush_to_disk, bool rotate_key)
+/**
+Writes log buffer to disk,
+which is the "write" part of log_write_up_to().
+
+This function does not flush anything.
+
+@return lsn of the last written record,
+   or 0 is there is nothing to do, i.e flush would not be necessary
+   even if flush_to_disk was set.
+*/
+static lsn_t log_write(lsn_t lsn, bool flush_to_disk, bool rotate_key)
 {
-#ifdef UNIV_DEBUG
-	ulint		loop_count	= 0;
-#endif /* UNIV_DEBUG */
-	byte*           write_buf;
-	lsn_t           write_lsn;
-
-	ut_ad(!srv_read_only_mode);
-	ut_ad(!rotate_key || flush_to_disk);
-
-	if (recv_no_ibuf_operations) {
-		/* Recovery is running and no operations on the log files are
-		allowed yet (the variable name .._no_ibuf_.. is misleading) */
-
-		return;
-	}
-
-loop:
-	ut_ad(++loop_count < 128);
-
-#if UNIV_WORD_SIZE > 7
-	/* We can do a dirty read of LSN. */
-	/* NOTE: Currently doesn't do dirty read for
-	(flush_to_disk == true) case, because the log_mutex
-	contention also works as the arbitrator for write-IO
-	(fsync) bandwidth between log files and data files. */
-	if (!flush_to_disk && log_sys.write_lsn >= lsn) {
-		return;
-	}
-#endif
-
-	log_write_mutex_enter();
-	ut_ad(!recv_no_log_write);
-
-	lsn_t	limit_lsn = flush_to_disk
-		? log_sys.flushed_to_disk_lsn
-		: log_sys.write_lsn;
-
-	if (limit_lsn >= lsn) {
-		log_write_mutex_exit();
-		return;
-	}
-
-	/* If it is a write call we should just go ahead and do it
-	as we checked that write_lsn is not where we'd like it to
-	be. If we have to flush as well then we check if there is a
-	pending flush and based on that we wait for it to finish
-	before proceeding further. */
-	if (flush_to_disk
-	    && (log_sys.n_pending_flushes > 0
-		|| !os_event_is_set(log_sys.flush_event))) {
-		/* Figure out if the current flush will do the job
-		for us. */
-		bool work_done = log_sys.current_flush_lsn >= lsn;
-
-		log_write_mutex_exit();
-
-		os_event_wait(log_sys.flush_event);
-
-		if (work_done) {
-			return;
-		} else {
-			goto loop;
-		}
-	}
+	lsn_t write_lsn;
 
 	log_mutex_enter();
+
+	ut_ad(!recv_no_log_write);
+
 	if (!flush_to_disk
 	    && log_sys.buf_free == log_sys.buf_next_to_write) {
 		/* Nothing to write and no flush to disk requested */
-		log_mutex_exit_all();
-		return;
+		log_mutex_exit();
+		return 0;
 	}
 
 	ulint		start_offset;
@@ -1039,16 +971,14 @@ loop:
 			      log_sys.write_lsn,
 			      log_sys.lsn));
 	if (flush_to_disk) {
-		log_sys.n_pending_flushes++;
-		log_sys.current_flush_lsn = log_sys.lsn;
-		os_event_reset(log_sys.flush_event);
+		write_lsn = log_sys.lsn;
 
 		if (log_sys.buf_free == log_sys.buf_next_to_write) {
-			/* Nothing to write, flush only */
-			log_mutex_exit_all();
-			log_write_flush_to_disk_low();
+			/* Nothing to write, maybe flush only */
+			if (write_lsn <= log_sys.flushed_to_disk_lsn)
+				write_lsn = 0;
 			log_mutex_exit();
-			return;
+			return write_lsn;
 		}
 	}
 
@@ -1067,7 +997,7 @@ loop:
 		log_sys.next_checkpoint_no);
 
 	write_lsn = log_sys.lsn;
-	write_buf = log_sys.buf;
+	byte *write_buf = log_sys.buf;
 
 	log_buffer_switch();
 
@@ -1122,14 +1052,155 @@ loop:
 		start_offset - area_start);
 	srv_stats.log_padded.add(pad_size);
 	log_sys.write_lsn = write_lsn;
+	if (srv_file_flush_method == SRV_O_DSYNC)
+		log_sys.flushed_to_disk_lsn = write_lsn;
+	return write_lsn;
+}
 
-	log_write_mutex_exit();
+/* A thread local helper structure, used in group commit lock below*/
+struct group_commit_lock_waiter_t:public intrusive::list_node<>
+{
+	std::condition_variable m_cv;
+	lsn_t m_value;
+	group_commit_lock_waiter_t():m_cv(),m_value(){}
+};
 
-	if (flush_to_disk) {
-		log_write_flush_to_disk_low();
-		ib_uint64_t flush_lsn = log_sys.flushed_to_disk_lsn;
-		log_mutex_exit();
+thread_local group_commit_lock_waiter_t tls_lock_waiter;
 
+/**
+A special kind of semaphore, which is helpful for
+performing group commit.
+
+It has a state consisting of
+1. locked (bool)
+2. current value (int). This value is always increasing.
+
+Operations supported on this semaphore
+
+1.acquire(num):
+- waits until current value exceeds num,
+or until lock is granted.
+
+returns EXPIRED if current_value >= num,
+or ACQUIRED, if current_value < num and lock is granted.
+
+2. release(num)
+- releases lock
+- sets new current value as max(num,current_value)
+- releases threads waiting in acquire()
+
+3. value()
+read current value
+*/
+
+struct log_group_commit_lock
+{
+	using value_type = lsn_t;
+	enum lock_return_code
+	{
+		ACQUIRED,
+		EXPIRED
+	};
+  std::mutex m_mtx;
+	std::atomic<lsn_t> m_value;
+	intrusive::list <group_commit_lock_waiter_t> m_waiters;
+	bool m_lock;
+
+	log_group_commit_lock():
+		m_mtx(),m_value(),m_lock()
+	{}
+
+	lsn_t value()
+	{
+		return m_value.load(std::memory_order::memory_order_relaxed);
+	}
+
+	lock_return_code acquire(value_type num)
+	{
+		if (num <= value())
+			return lock_return_code::EXPIRED;
+
+		tls_lock_waiter.m_value = num;
+
+		std::unique_lock<std::mutex> lk(m_mtx);
+		while(num > value())
+		{
+			if (!m_lock)
+			{
+				m_lock = true;
+				return lock_return_code::ACQUIRED;
+			}
+			m_waiters.push_back(tls_lock_waiter);
+			tls_lock_waiter.m_cv.wait(lk);
+			m_waiters.remove(tls_lock_waiter);
+		}
+		return lock_return_code::EXPIRED;
+	}
+
+	void release(value_type num)
+	{
+		std::unique_lock<std::mutex> lk(m_mtx);
+		m_lock = 0;
+
+		if (num > value())
+			m_value.store(num,std::memory_order_relaxed);
+
+		/* We need to wake all waiters for value <= num,
+		and one more, which would then take the lock.*/
+		int extra_wake = 0;
+		for (auto &waiter : m_waiters)
+		{
+			if (waiter.m_value <= num || extra_wake++ == 0)
+				waiter.m_cv.notify_one();
+		}
+	}
+};
+
+static log_group_commit_lock write_lock;
+static log_group_commit_lock flush_lock;
+
+/** Ensure that the log has been written to the log file up to a given
+log entry (such as that of a transaction commit). Start a new write, or
+wait and check if an already running write is covering the request.
+@param[in]	lsn		log sequence number that should be
+included in the redo log file write
+@param[in]	flush_to_disk	whether the written log should also
+be flushed to the file system
+@param[in]	rotate_key	whether to rotate the encryption key */
+void log_write_up_to(lsn_t lsn, bool flush_to_disk, bool rotate_key)
+{
+	lsn_t           write_lsn = lsn;
+
+	ut_ad(!srv_read_only_mode);
+	ut_ad(!rotate_key || flush_to_disk);
+
+	if (recv_no_ibuf_operations) {
+		/* Recovery is running and no operations on the log files are
+		allowed yet (the variable name .._no_ibuf_.. is misleading) */
+
+		return;
+	}
+
+
+	if(write_lock.acquire(lsn) == log_group_commit_lock::ACQUIRED) {
+		write_lsn = log_write(lsn, flush_to_disk, rotate_key);
+		write_lock.release(write_lsn);
+	}
+
+	if (!flush_to_disk ||  !write_lsn) {
+		return;
+	}
+
+	if (srv_file_flush_method == SRV_O_DSYNC) {
+		/* No need to flush, already flushed during write.*/
+		innobase_mysql_log_notify(write_lock.value());
+		return;
+	}
+
+	if (flush_lock.acquire(lsn) == log_group_commit_lock::ACQUIRED) {
+		auto flush_lsn = write_lock.value();
+		log_write_flush_to_disk_low(flush_lsn);
+		flush_lock.release(flush_lsn);
 		innobase_mysql_log_notify(flush_lsn);
 	}
 }
@@ -1162,8 +1233,7 @@ log_buffer_sync_in_background(
 	lsn = log_sys.lsn;
 
 	if (flush
-	    && log_sys.n_pending_flushes > 0
-	    && log_sys.current_flush_lsn >= lsn) {
+	    && log_sys.flushed_to_disk_lsn >= lsn) {
 		/* The write + flush will write enough */
 		log_mutex_exit();
 		return;
@@ -1728,7 +1798,7 @@ wait_suspend_loop:
 	if (log_sys.is_initialised()) {
 		log_mutex_enter();
 		const ulint	n_write	= log_sys.n_pending_checkpoint_writes;
-		const ulint	n_flush	= log_sys.n_pending_flushes;
+		const ulint	n_flush	= log_sys.pending_flushes;
 		log_mutex_exit();
 
 		if (log_scrub_thread_active || n_write || n_flush) {
@@ -1901,7 +1971,7 @@ log_print(
 		ULINTPF " pending log flushes, "
 		ULINTPF " pending chkp writes\n"
 		ULINTPF " log i/o's done, %.2f log i/o's/second\n",
-		log_sys.n_pending_flushes,
+		log_sys.pending_flushes.load(),
 		log_sys.n_pending_checkpoint_writes,
 		log_sys.n_log_ios,
 		static_cast<double>(
@@ -1937,9 +2007,7 @@ void log_t::close()
   ut_free_dodump(buf, srv_log_buffer_size * 2);
   buf = NULL;
 
-  os_event_destroy(flush_event);
   mutex_free(&mutex);
-  mutex_free(&write_mutex);
   mutex_free(&log_flush_order_mutex);
 
   if (!srv_read_only_mode && srv_scrub_log)
