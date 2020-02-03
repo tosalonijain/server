@@ -1878,7 +1878,8 @@ binlog_commit_flush_trx_cache(THD *thd, bool all, binlog_cache_mngr *cache_mngr)
   char buf[q_len + ser_buf_size]= "COMMIT";
   size_t buflen= sizeof("COMMIT") - 1;
 
-  if (thd->lex->sql_command == SQLCOM_XA_COMMIT)
+  if (thd->lex->sql_command == SQLCOM_XA_COMMIT &&
+      thd->lex->xa_opt != XA_ONE_PHASE)
   {
     DBUG_ASSERT(thd->transaction.xid_state.is_explicit_XA());
     DBUG_ASSERT(thd->transaction.xid_state.xid_cache_element->xa_state ==

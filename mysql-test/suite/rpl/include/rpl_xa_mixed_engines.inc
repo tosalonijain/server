@@ -67,6 +67,17 @@ if ($command == run)
    --eval XA PREPARE '$xid'
   }
   --eval $xa_terminate '$xid' $one_phase
+
+  # Ineffective transactional table operation case
+
+  --eval XA START '$xid'
+  UPDATE t SET a = 99 where a = -1;
+  --eval XA END '$xid'
+  if ($xa_prepare_opt)
+  {
+   --eval XA PREPARE '$xid'
+  }
+  --eval $xa_terminate '$xid' $one_phase
 }
 
 if ($command == cleanup)
